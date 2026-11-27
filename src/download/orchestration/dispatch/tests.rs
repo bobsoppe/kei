@@ -179,6 +179,66 @@ async fn writable_dispatch_requires_state_before_provider_or_file_work() {
 }
 
 #[tokio::test]
+async fn provisional_managed_pass_without_inventory_only_authority_is_refused() {
+    let root = TempDir::new().unwrap();
+    let media = root.path().join("existing.jpg");
+    std::fs::write(&media, b"retained media").unwrap();
+    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    db.set_metadata("sync_token:PrimarySync", "retained-token")
+        .await
+        .unwrap();
+    let before = db
+        .acquire_lock("before managed refusal")
+        .unwrap()
+        .total_changes();
+    let session = CountingQuerySession::new(json!({"records": []}), 0);
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: super::super::test_support::album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(session.clone()),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let mut config = test_config();
+    config.directory = Arc::from(root.path());
+    config.state_db = Some(db.clone());
+    config.provisional = true;
+    config.edited_naming = crate::types::EditedNaming::Primary;
+    let error = download_photos_with_sync(
+        &Client::new(),
+        &[pass],
+        Arc::new(config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("Unqualified indexing recovery"),
+        "{error}"
+    );
+    assert_eq!(session.count_query_count(), 0);
+    assert_eq!(session.records_query_count(), 0);
+    assert_eq!(
+        db.acquire_lock("after managed refusal")
+            .unwrap()
+            .total_changes(),
+        before
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("retained-token")
+    );
+    assert_eq!(std::fs::read(&media).unwrap(), b"retained media");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
 async fn writable_dispatch_requires_authenticated_selection_before_any_mutation() {
     for incremental in [false, true] {
         let root = TempDir::new().unwrap();

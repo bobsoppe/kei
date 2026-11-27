@@ -469,6 +469,7 @@ pub(super) async fn refresh_indexing_library_plans_with_recovery(
 ) -> anyhow::Result<()> {
     let mut indexing_hold = false;
     let mut finished_before_scope = true;
+    let mut managed_running_zones = rustc_hash::FxHashSet::default();
     for library in library_states.iter_mut() {
         library.indexing_deferred = false;
         let Some((finished, hold)) =
@@ -486,6 +487,15 @@ pub(super) async fn refresh_indexing_library_plans_with_recovery(
                 ))
                 .await?
                 .is_some();
+        }
+        if !finished
+            && crate::sync_cycle::managed_primary_layout(config, &library.zone_name, state_db)
+                .await?
+        {
+            // The cycle defers this zone before enumeration; only it and its
+            // dependents stay stale, so independent libraries can still qualify.
+            managed_running_zones.insert(library.zone_name.clone());
+            continue;
         }
         finished_before_scope &= finished;
     }
@@ -509,8 +519,8 @@ pub(super) async fn refresh_indexing_library_plans_with_recovery(
         (*library_states, *collection_context) =
             resolve_library_plans_with_recovery(photos_service, libraries, config, recovery)
                 .await?;
-        if !finished_before_scope {
-            for library in library_states {
+        for library in library_states {
+            if !finished_before_scope || managed_running_zones.contains(&library.zone_name) {
                 // A fresh but provisional scope must not be certified by a
                 // subsequent FINISHED probe. The next wake rebuilds it again.
                 library.plan_is_stale = true;

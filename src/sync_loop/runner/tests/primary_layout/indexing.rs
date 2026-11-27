@@ -1,7 +1,7 @@
 //! Managed indexing recovery uses real readiness, reopened state and file owners.
 use super::{
     CycleOptions, EDIT_ONE, EditedNaming, IndexingOptions, ORIGINAL, assert_bytes, cycle,
-    cycle_options, db_count, records, server, try_cycle_options,
+    cycle_options, db_count, records, server,
 };
 use crate::sync_cycle::{
     indexing_materialization_key, indexing_reconciliation_key, indexing_replay_key,
@@ -117,16 +117,18 @@ async fn indexing_managed_reopen_qualifies_then_materializes_omissions_with_quie
         let gets = server.received_requests().await.unwrap().len();
         for _ in 0..2 {
             let running = readiness("RUNNING");
-            let error = try_cycle_options(root.path(), vec![], true, naming, options(&running))
-                .await
-                .unwrap_err();
+            let (deferred, _) =
+                cycle_options(root.path(), vec![], true, naming, options(&running)).await;
             assert!(
-                error.to_string().contains("Unqualified indexing recovery"),
-                "{error:#}"
+                deferred.failed_count > 0,
+                "{naming:?}: a managed RUNNING cycle must defer rather than fail: {:?}",
+                deferred.stats
             );
+            assert!(!deferred.can_advance_database_checkpoint());
             assert_hold(root.path(), &cursor, true, false);
-            assert_eq!(media(root.path()), before_media);
-            assert_eq!(managed_state(root.path()), before_state);
+            assert_eq!(media(root.path()), before_media, "{naming:?}");
+            assert_eq!(managed_state(root.path()), before_state, "{naming:?}");
+            assert!(running.cursors.lock().unwrap().is_empty(), "{naming:?}");
         }
         let all = with_omitted(&server);
         let finished = readiness("FINISHED");
@@ -206,17 +208,17 @@ async fn indexing_managed_inventory_faults_never_publish_or_release_hold() {
         .await;
         let cursor = metadata(root.path(), CURSOR).unwrap();
         let running = readiness("RUNNING");
-        assert!(
-            try_cycle_options(
-                root.path(),
-                vec![],
-                true,
-                EditedNaming::Primary,
-                options(&running)
-            )
-            .await
-            .is_err()
-        );
+        let (deferred, _) = cycle_options(
+            root.path(),
+            vec![],
+            true,
+            EditedNaming::Primary,
+            options(&running),
+        )
+        .await;
+        assert!(deferred.failed_count > 0, "{fault}: {:?}", deferred.stats);
+        assert!(!deferred.can_advance_database_checkpoint(), "{fault}");
+        assert_hold(root.path(), &cursor, true, false);
         let before_media = media(root.path());
         let before_state = managed_state(root.path());
         let gets = server.received_requests().await.unwrap().len();
@@ -276,17 +278,17 @@ async fn indexing_managed_materialization_failure_keeps_full_debt_and_cursor() {
         .await;
         let cursor = metadata(root.path(), CURSOR).unwrap();
         let running = readiness("RUNNING");
-        assert!(
-            try_cycle_options(
-                root.path(),
-                vec![],
-                true,
-                EditedNaming::Primary,
-                options(&running)
-            )
-            .await
-            .is_err()
-        );
+        let (deferred, _) = cycle_options(
+            root.path(),
+            vec![],
+            true,
+            EditedNaming::Primary,
+            options(&running),
+        )
+        .await;
+        assert!(deferred.failed_count > 0, "{fault}: {:?}", deferred.stats);
+        assert!(!deferred.can_advance_database_checkpoint(), "{fault}");
+        assert_hold(root.path(), &cursor, true, false);
         let current = records(&server, Some(("edit-one", EDIT_ONE)));
         cycle_options(
             root.path(),
@@ -409,18 +411,36 @@ async fn indexing_managed_pending_journal_is_held_even_under_suffix_then_recover
     let before_media = media(root.path());
     let before_state = managed_state(root.path());
     for _ in 0..2 {
-        let error = try_cycle_options(
+        let running = readiness("RUNNING");
+        let (deferred, _) = cycle_options(
             root.path(),
             vec![],
             true,
             EditedNaming::Suffix,
-            options(&readiness("RUNNING")),
+            options(&running),
         )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("Unqualified indexing recovery"));
+        .await;
+        assert!(
+            deferred.failed_count > 0,
+            "managed RUNNING must defer: {:?}",
+            deferred.stats
+        );
+        assert!(!deferred.can_advance_database_checkpoint());
+        assert_hold(root.path(), "trusted-before", true, false);
+        assert_eq!(
+            db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings"),
+            0
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='publishing'"
+            ),
+            1
+        );
         assert_eq!(media(root.path()), before_media);
         assert_eq!(managed_state(root.path()), before_state);
+        assert!(running.cursors.lock().unwrap().is_empty());
     }
     let (inventory, _) = cycle_options(
         root.path(),
@@ -474,17 +494,17 @@ async fn indexing_managed_local_modification_resolves_and_foreign_collision_is_p
     .await;
     let cursor = metadata(root.path(), CURSOR).unwrap();
     let running = readiness("RUNNING");
-    assert!(
-        try_cycle_options(
-            root.path(),
-            vec![],
-            true,
-            EditedNaming::Primary,
-            options(&running)
-        )
-        .await
-        .is_err()
-    );
+    let (deferred, _) = cycle_options(
+        root.path(),
+        vec![],
+        true,
+        EditedNaming::Primary,
+        options(&running),
+    )
+    .await;
+    assert!(deferred.failed_count > 0, "{:?}", deferred.stats);
+    assert!(!deferred.can_advance_database_checkpoint());
+    assert_hold(root.path(), &cursor, true, false);
     let current = with_omitted(&server);
     let target = root.path().join("media");
     let local = b"independent local modification";
@@ -557,17 +577,17 @@ async fn indexing_managed_sidecar_modification_remains_protected_until_restored(
     )
     .await;
     let cursor = metadata(root.path(), CURSOR).unwrap();
-    assert!(
-        try_cycle_options(
-            root.path(),
-            vec![],
-            true,
-            EditedNaming::Primary,
-            make_options(readiness("RUNNING"))
-        )
-        .await
-        .is_err()
-    );
+    let (deferred, _) = cycle_options(
+        root.path(),
+        vec![],
+        true,
+        EditedNaming::Primary,
+        make_options(readiness("RUNNING")),
+    )
+    .await;
+    assert!(deferred.failed_count > 0, "{:?}", deferred.stats);
+    assert!(!deferred.can_advance_database_checkpoint());
+    assert_hold(root.path(), &cursor, true, false);
     let path = root.path().join("media/IMG_0501.JPG.xmp");
     let trusted_sidecar = std::fs::read(&path).unwrap();
     let local_sidecar = b"independent local sidecar contents";

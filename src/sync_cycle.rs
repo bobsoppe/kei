@@ -175,6 +175,23 @@ pub(crate) async fn indexing_for_cycle(
     }
 }
 
+/// Managed replacement layout facts for this selected zone. Readiness alone
+/// cannot classify a library: configured primary naming, a recorded binding,
+/// or a pending journal operation can.
+pub(crate) async fn managed_primary_layout(
+    config: &config::Config,
+    zone_name: &str,
+    db: Option<&dyn download::DownloadStore>,
+) -> anyhow::Result<bool> {
+    if config.photos.edited_naming == crate::types::EditedNaming::Primary {
+        return Ok(true);
+    }
+    match db {
+        Some(db) => Ok(db.has_primary_layouts(zone_name).await?),
+        None => Ok(false),
+    }
+}
+
 pub(crate) const RETAINED_CHECKPOINT_HOLD_PREFIX: &str = "retained_checkpoint_hold:";
 const RETAINED_CHECKPOINT_RETRY_SECONDS: i64 = 60 * 60;
 const RETAINED_CHECKPOINT_MAX_ATTEMPTS: u8 = 3;
@@ -1210,6 +1227,24 @@ async fn run_cycle_inner(
             path_reconciliation_complete = false;
             continue;
         };
+        // A managed primary layout cannot enumerate provisionally; defer it
+        // through the unavailable-readiness accounting instead of a refusal.
+        if !indexing_finished
+            && managed_primary_layout(config, &lib_state.zone_name, state_db).await?
+        {
+            tracing::warn!(
+                zone = %lib_state.zone_name,
+                layout = "managed primary",
+                readiness = "RUNNING",
+                "Managed primary layout library is deferred while photo library indexing reports RUNNING; preserving checkpoints and media"
+            );
+            deferred_indexing_zones.insert(lib_state.zone_name.as_str());
+            capture_authority_libraries.remove(&lib_state.zone_name);
+            cycle_failed_count = cycle_failed_count.saturating_add(1);
+            db_sync_token_advance_safe = false;
+            path_reconciliation_complete = false;
+            continue;
+        }
         let indexing_reconciliation = indexing_hold_at_start.is_some() || !indexing_finished;
         if !has_active_passes(lib_state) {
             db_sync_token_advance_safe &= !indexing_reconciliation;
@@ -1574,11 +1609,7 @@ async fn run_cycle_inner(
         Arc::make_mut(&mut download_config).provisional =
             indexing_reconciliation || !indexing_finished;
         let managed_indexing_recovery = indexing_reconciliation
-            && (download_config.edited_naming == crate::types::EditedNaming::Primary
-                || match state_db {
-                    Some(db) => db.has_primary_layouts(&lib_state.zone_name).await?,
-                    None => false,
-                });
+            && managed_primary_layout(config, &lib_state.zone_name, state_db).await?;
         Arc::make_mut(&mut download_config).indexing_inventory_only =
             managed_indexing_recovery && indexing_finished;
         if (indexing_reconciliation || indexing_replay_pending)

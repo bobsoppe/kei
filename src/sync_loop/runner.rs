@@ -28,6 +28,18 @@ use crate::{
     download, health, make_password_provider, notifications, password, retry, shutdown, state,
 };
 
+/// One-shot runs surface a deferred cycle through the existing partial-sync
+/// exit; watch mode keeps the failure backlog and continues.
+fn one_shot_failed_cycle_exit(
+    is_watch_mode: bool,
+    cumulative_failed_count: usize,
+) -> anyhow::Result<()> {
+    if !is_watch_mode && cumulative_failed_count > 0 {
+        return Err(PartialSyncError(cumulative_failed_count).into());
+    }
+    Ok(())
+}
+
 /// Run the sync command: authenticate, enumerate photos, download, and
 /// optionally loop in watch mode.
 pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> anyhow::Result<()> {
@@ -933,9 +945,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         }
         let backfill_elapsed = backfill_started.elapsed();
-        if !is_watch_mode && cumulative_failed_count > 0 {
-            return Err(PartialSyncError(cumulative_failed_count).into());
-        }
+        one_shot_failed_cycle_exit(is_watch_mode, cumulative_failed_count)?;
 
         if current_work_complete
             && !shutdown_token.is_cancelled()

@@ -29,7 +29,13 @@ On startup, watch mode waits for the next interval before retrying incomplete di
 While indexing, the download dispatcher uses full queries without incremental
 replay, retained-work admission, metadata repair, retry retirement, or album
 snapshot completion. Ordinary media still uses the existing verified publication
-and durable finalization path. Managed primary layouts wait for `FINISHED`.
+and durable finalization path. A managed primary layout whose pre-enumeration
+readiness is `RUNNING` is deferred for the cycle: the cycle keeps or writes
+`indexing_reconciliation_required:<zone>`, leaves the zone and database checkpoints and local media
+untouched, and counts the deferral so watch mode retries on the next wake while a
+one-shot run reports the existing partial-sync exit. Independent libraries still
+run in that cycle. When readiness returns `FINISHED`, the same hold proceeds
+through the inventory-only recovery below.
 Watch cycles with a hold bypass the database no-change shortcut and rebuild
 collection and album plans so omitted albums can reappear after indexing.
 
@@ -64,7 +70,10 @@ inventory cannot replace a comparable inventory anchor.
 ## Managed work and inventory evidence
 
 Managed primary configuration, recorded bindings and pending operations retain
-the RUNNING guard, including a later suffix configuration. Once FINISHED, the
+the RUNNING guard, including a later suffix configuration. The guard defers the
+library before enumeration instead of letting the download dispatcher refuse the
+cycle; the dispatcher still rejects any provisional managed pass that lacks
+inventory-only authority. Once FINISHED, the
 held phase uses the same full-enumeration owner and token/EOF evidence, but
 only consumes validated provider identities. It does not invoke local task
 planning, journal recovery, publication, metadata drains, retry retirement or

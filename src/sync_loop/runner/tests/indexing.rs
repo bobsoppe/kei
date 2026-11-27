@@ -1396,6 +1396,324 @@ async fn indexing_ready_peer_reconciles_and_advances_while_neighbor_is_unknown()
     );
 }
 
+#[test]
+fn deferred_cycle_exit_continues_in_watch_and_reports_partial_for_one_shot() {
+    // Watch mode keeps the failure backlog and continues to the next cycle.
+    assert!(super::super::one_shot_failed_cycle_exit(true, 1).is_ok());
+    assert!(super::super::one_shot_failed_cycle_exit(true, 0).is_ok());
+
+    // One-shot reports the existing partial-sync exit for a deferred cycle.
+    let error = super::super::one_shot_failed_cycle_exit(false, 1).unwrap_err();
+    assert_eq!(
+        crate::classify_exit_error(&error),
+        crate::ExitClassification::Partial
+    );
+    assert_eq!(error.to_string(), "1 sync failures");
+    assert!(super::super::one_shot_failed_cycle_exit(false, 0).is_ok());
+}
+
+#[tokio::test]
+async fn indexing_managed_running_primary_defers_while_ready_peer_advances() {
+    use crate::icloud::photos::PhotosService;
+    use crate::sync_loop::{planning, precheck};
+
+    const PEER: &str = "SharedSync-TEST";
+    const PEER_CURSOR: &str = "sync_token:SharedSync-TEST";
+    let root = tempfile::tempdir().unwrap();
+    let db = indexing_db(&root.path().join("state.db")).await;
+    let mut config = make_run_cycle_config();
+    config.filters.selection.albums = crate::selection::AlbumSelector::None;
+    config.filters.selection.unfiled = true;
+    config.filters.selection.libraries.shared_all = true;
+    let primary_hold = indexing_reconciliation_key(ZONE);
+    let peer_hold = indexing_reconciliation_key(PEER);
+    let peer_replay = crate::sync_cycle::indexing_replay_key(PEER);
+    for (key, value) in [
+        (CURSOR, "primary-before"),
+        (PEER_CURSOR, "peer-before"),
+        (&peer_hold, "1"),
+    ] {
+        db.set_metadata(key, value).await.unwrap();
+    }
+    // Managed primary layout fact: a recorded binding for the selected zone.
+    rusqlite::Connection::open(root.path().join("state.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO primary_layout_bindings(family,library,source_library,child,generation,decision,policy,binding) \
+             VALUES('indexing-managed-running','PrimarySync','PrimarySync','managed-child',1,'kept','test',X'00')",
+            [],
+        )
+        .unwrap();
+    let enum_hash = download::compute_config_hash(&config);
+    db.set_metadata(ENUM_CONFIG_HASH_KEY, &enum_hash)
+        .await
+        .unwrap();
+
+    let running = provider("RUNNING", &[], "");
+    let primary = library(&running, &db).await.library;
+    let ready = provider("FINISHED", &[], "");
+    let peer = PhotoLibrary::new(
+        "https://example.com".into(),
+        Arc::default(),
+        Box::new(ready.clone()),
+        Arc::new(json!({"zoneName":PEER,"ownerRecordName":"_defaultOwner"})),
+        "shared".into(),
+        retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    let libraries = vec![primary.clone(), peer.clone()];
+    let mut service = PhotosService::for_testing_with_libraries(
+        Box::new(running.clone()),
+        primary.clone(),
+        HashMap::from([(ZONE.to_owned(), primary)]),
+        HashMap::from([(PEER.to_owned(), peer)]),
+    );
+    service.set_shadow_capture(indexing_capture(&db));
+    let (mut states, mut context) =
+        planning::resolve_library_plans(&mut service, &libraries, &config)
+            .await
+            .unwrap();
+    assert_eq!(states.len(), 2);
+    assert!(states.iter().all(|s| s.cross_zone_libraries.is_empty()));
+    let (_dir, session) = make_shared_session_for_run_cycle().await;
+    let build = make_run_cycle_download_config_builder(root.path(), db.clone());
+    let scope =
+        precheck::DbPrecheckScope::from_config(&config, &states, &build, &enum_hash).unwrap();
+
+    tokio::time::pause();
+    let mut inventory_queries = 0;
+    for round in 0..3 {
+        if round > 0 {
+            for state in &mut states {
+                state.plan_needs_refresh = true;
+            }
+        }
+        planning::refresh_indexing_library_plans(
+            &mut service,
+            &libraries,
+            &config,
+            Some(db.as_ref()),
+            &mut states,
+            &mut context,
+        )
+        .await
+        .unwrap();
+        let precheck =
+            precheck::check_changes_database(Some(db.as_ref()), &states, &mut service, &scope)
+                .await;
+        assert_eq!(precheck, precheck::WatchPrecheck::proceed_all());
+        planning::refresh_needed_library_plans(
+            &mut states,
+            &config.filters.selection,
+            &context,
+            precheck.changed_zones(),
+            &mut 0,
+        )
+        .await;
+
+        let result = run_cycle(
+            &states.iter().collect::<Vec<_>>(),
+            &config,
+            Some(db.as_ref()),
+            &build,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.failed_count > 0,
+            "the deferred managed primary must count as a failed library: {:?}",
+            result.stats
+        );
+        assert!(!result.can_advance_database_checkpoint());
+        assert_eq!(
+            db.get_metadata(CURSOR).await.unwrap().as_deref(),
+            Some("primary-before")
+        );
+        assert!(db.get_metadata(&primary_hold).await.unwrap().is_some());
+        assert_eq!(running.queries.load(Ordering::SeqCst), 0);
+        assert!(running.changes.lock().unwrap().is_empty());
+        assert!(db.get_metadata(&peer_hold).await.unwrap().is_none());
+        assert_eq!(
+            db.get_metadata(&peer_replay).await.unwrap().is_some(),
+            round == 0
+        );
+        assert_eq!(
+            db.get_metadata(PEER_CURSOR).await.unwrap().as_deref(),
+            Some(if round == 0 {
+                "peer-before"
+            } else {
+                "trusted-after"
+            })
+        );
+        let queries = ready.queries.load(Ordering::SeqCst);
+        if round == 0 {
+            assert!(queries > 0, "the peer qualified a full inventory");
+        } else if round == 1 {
+            inventory_queries = queries;
+            assert_eq!(
+                db.get_summary()
+                    .await
+                    .unwrap()
+                    .provider_checkpoint_status
+                    .as_deref(),
+                Some("preserved"),
+                "the deferred managed hold still applies to the aggregate status"
+            );
+        } else {
+            assert_eq!(
+                queries, inventory_queries,
+                "no peer inventory on a quiet wake"
+            );
+        }
+    }
+    assert_eq!(
+        *ready.changes.lock().unwrap(),
+        ["peer-before", "trusted-after"]
+    );
+}
+
+#[tokio::test]
+async fn indexing_managed_running_source_keeps_dependent_plan_stale() {
+    use crate::icloud::photos::PhotosService;
+    use crate::sync_loop::planning;
+
+    const SHARED: &str = "SharedSync-TEST";
+    let root = tempfile::tempdir().unwrap();
+    let db = indexing_db(&root.path().join("state.db")).await;
+    let mut config = make_run_cycle_config();
+    config.filters.selection.albums = crate::selection::AlbumSelector::Named {
+        included: ["A".to_owned()].into_iter().collect(),
+        excluded: Default::default(),
+    };
+    config.filters.selection.albums_explicit = true;
+    config.filters.selection.unfiled = false;
+    config.filters.selection.libraries.shared_all = true;
+    rusqlite::Connection::open(root.path().join("state.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO primary_layout_bindings(family,library,source_library,child,generation,decision,policy,binding) \
+             VALUES('indexing-managed-dependent','PrimarySync','PrimarySync','managed-child',1,'kept','test',X'00')",
+            [],
+        )
+        .unwrap();
+
+    let running = provider("RUNNING", &[], "");
+    let primary = library(&running, &db).await.library;
+    let ready = provider("FINISHED", &[], "");
+    let shared = PhotoLibrary::new(
+        "https://example.com".into(),
+        Arc::default(),
+        Box::new(ready.clone()),
+        Arc::new(json!({"zoneName":SHARED,"ownerRecordName":"_defaultOwner"})),
+        "shared".into(),
+        retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    let libraries = vec![primary.clone(), shared.clone()];
+    let mut service = PhotosService::for_testing_with_libraries(
+        Box::new(running.clone()),
+        primary.clone(),
+        HashMap::from([(ZONE.to_owned(), primary)]),
+        HashMap::from([(SHARED.to_owned(), shared)]),
+    );
+    service.set_shadow_capture(indexing_capture(&db));
+    let (mut states, mut context) =
+        planning::resolve_library_plans(&mut service, &libraries, &config)
+            .await
+            .unwrap();
+    assert_eq!(states.len(), 2);
+    assert!(
+        states
+            .iter()
+            .all(|state| !state.cross_zone_libraries.is_empty()),
+        "explicit album selection must make the managed zone a contributing source"
+    );
+    planning::refresh_indexing_library_plans(
+        &mut service,
+        &libraries,
+        &config,
+        Some(db.as_ref()),
+        &mut states,
+        &mut context,
+    )
+    .await
+    .unwrap();
+    for state in &states {
+        assert!(
+            state.plan_is_stale,
+            "{} must stay stale while the managed source is RUNNING",
+            state.zone_name
+        );
+    }
+}
+
+#[tokio::test]
+async fn indexing_managed_running_dry_run_defers_without_writing_state() {
+    let root = tempfile::tempdir().unwrap();
+    let db = indexing_db(&root.path().join("state.db")).await;
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    db.set_metadata(CURSOR, "trusted-before").await.unwrap();
+    rusqlite::Connection::open(root.path().join("state.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO primary_layout_bindings(family,library,source_library,child,generation,decision,policy,binding) \
+             VALUES('indexing-dry-run','PrimarySync','PrimarySync','managed-child',1,'kept','test',X'00')",
+            [],
+        )
+        .unwrap();
+    let mut config = make_run_cycle_config();
+    config.runtime.dry_run = true;
+    let provider = provider("RUNNING", &[], "");
+    let library = library(&provider, &db).await;
+    let build = make_run_cycle_download_config_builder(&media, db.clone());
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let result = run_cycle(
+        &[&library],
+        &config,
+        Some(db.as_ref()),
+        &build,
+        download::DownloadControls::dry_run_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(result.failed_count > 0);
+    assert!(!result.can_advance_database_checkpoint());
+    assert_eq!(
+        db.get_metadata(CURSOR).await.unwrap().as_deref(),
+        Some("trusted-before")
+    );
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_none(),
+        "dry run must not write the indexing hold"
+    );
+    assert!(
+        db.get_metadata(&crate::sync_cycle::indexing_materialization_key(ZONE))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+    assert!(db.get_pending().await.unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_dir(&media).unwrap().count(),
+        0,
+        "dry run must not write media"
+    );
+    assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+    assert!(provider.changes.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
     use crate::icloud::photos::PhotosService;
