@@ -1740,7 +1740,9 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
                 let limit = request["resultsLimit"].as_u64().unwrap_or(0) / 2;
                 let records: Vec<_> = self
                     .records
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .skip(offset as usize)
                     .take(limit as usize)
                     .flatten()

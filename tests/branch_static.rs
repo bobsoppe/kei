@@ -2769,7 +2769,7 @@ fi
     );
     assert!(!calls.is_empty());
     assert_eq!(calls.len() % 2, 0);
-    for pair in calls.chunks_exact(2) {
+    for pair in calls.as_chunks::<2>().0 {
         assert_eq!(pair[0], format!("{}\t--\t--list", pair[1]));
         assert!(!pair[1].contains("--features"));
     }
